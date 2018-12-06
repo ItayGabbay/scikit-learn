@@ -154,6 +154,7 @@ class BaseForest(six.with_metaclass(ABCMeta, BaseEnsemble)):
         self.verbose = verbose
         self.warm_start = warm_start
         self.class_weight = class_weight
+        self.nb_clfs = {}
 
     def apply(self, X):
         """Apply trees in the forest to X, return leaf indices.
@@ -314,11 +315,13 @@ class BaseForest(six.with_metaclass(ABCMeta, BaseEnsemble)):
                 random_state.randint(MAX_INT, size=len(self.estimators_))
 
             trees = []
+
             for i in range(n_more_estimators):
                 tree = self._make_estimator(append=False,
                                             random_state=random_state)
                 trees.append(tree)
-
+                self.nb_clfs[i] = {}
+            self.unq_classes = np.unique(y)
             # Parallel loop: we prefer the threading backend as the Cython code
             # for fitting the trees is internally releasing the Python GIL
             # making threading more efficient than multiprocessing in
@@ -333,7 +336,24 @@ class BaseForest(six.with_metaclass(ABCMeta, BaseEnsemble)):
                 for i, t in enumerate(trees))
 
             # Collect newly grown trees
+            from sklearn.tree._tree import TREE_LEAF
+            from sklearn.naive_bayes import GaussianNB
             self.estimators_.extend(trees)
+            for i in range(len(trees)):
+                leaves = np.where(trees[i].tree_.children_left == TREE_LEAF)[0]
+                samples_in_nodes = trees[i].tree_.apply(X)
+                for leaf in leaves:
+                    #Take only the samples of the current leaf
+                    leaf_samples = np.where(samples_in_nodes == leaf)[0]
+                    nb_X = X.take(leaf_samples, axis=0)
+                    nb_y = y.take(leaf_samples, axis=0)
+
+                    nb_clf = GaussianNB()
+
+                    nb_clf.fit(nb_X, nb_y.ravel())
+                    self.nb_clfs[i][leaf] = {}
+                    self.nb_clfs[i][leaf]['model'] = nb_clf
+                    self.nb_clfs[i][leaf]['unique_classes'] = np.unique(nb_y)
 
         if self.oob_score:
             self._set_oob_score(X, y)
@@ -520,7 +540,7 @@ class ForestClassifier(six.with_metaclass(ABCMeta, BaseForest,
 
         return y, expanded_class_weight
 
-    def predict(self, X):
+    def predict(self, X, use_nb = False):
         """Predict class for X.
 
         The predicted class of an input sample is a vote by the trees in
@@ -540,7 +560,7 @@ class ForestClassifier(six.with_metaclass(ABCMeta, BaseForest,
         y : array of shape = [n_samples] or [n_samples, n_outputs]
             The predicted classes.
         """
-        proba = self.predict_proba(X)
+        proba = self.predict_proba(X, use_nb)
 
         if self.n_outputs_ == 1:
             return self.classes_.take(np.argmax(proba, axis=1), axis=0)
@@ -556,7 +576,7 @@ class ForestClassifier(six.with_metaclass(ABCMeta, BaseForest,
 
             return predictions
 
-    def predict_proba(self, X):
+    def predict_proba(self, X, use_nb):
         """Predict class probabilities for X.
 
         The predicted class probabilities of an input sample are computed as
@@ -589,11 +609,26 @@ class ForestClassifier(six.with_metaclass(ABCMeta, BaseForest,
         all_proba = [np.zeros((X.shape[0], j), dtype=np.float64)
                      for j in np.atleast_1d(self.n_classes_)]
         lock = threading.Lock()
-        Parallel(n_jobs=n_jobs, verbose=self.verbose,
-                 **_joblib_parallel_args(require="sharedmem"))(
-            delayed(_accumulate_prediction)(e.predict_proba, X, all_proba,
-                                            lock)
-            for e in self.estimators_)
+        if not use_nb:
+            Parallel(n_jobs=n_jobs, verbose=self.verbose,
+                     **_joblib_parallel_args(require="sharedmem"))(
+                delayed(_accumulate_prediction)(e.predict_proba, X, all_proba,
+                                                lock)
+                for e in self.estimators_)
+        else:
+            for sample_index in range(len(X)):
+                sample = X[sample_index]
+                for tree in range(len(self.estimators_)):
+                    estimator = self.estimators_[tree]
+                    leaf = estimator.apply(sample.reshape(1, -1))[0]
+                    nb_proba = self.nb_clfs[tree][leaf]['model'].predict_proba(sample.reshape(1, -1))[0]
+                    final_proba = np.zeros(len(self.unq_classes), dtype=np.float64)
+                    unique_classes = self.nb_clfs[tree][leaf]['unique_classes']
+                    for i in range(len(unique_classes)):
+                        final_proba[int(unique_classes[i])] = nb_proba[i]
+
+                    all_proba[0][sample_index] += final_proba
+
 
         for proba in all_proba:
             proba /= len(self.estimators_)
